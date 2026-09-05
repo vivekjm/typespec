@@ -1,0 +1,49 @@
+name: Validate unordered diagnostics 11710
+
+on:
+  push:
+    branches:
+      - maintenance/unordered-11710-validation-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compiler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install repository-pinned pnpm
+        run: npm install --global pnpm@11.10.0
+      - name: Install and bootstrap compiler dependencies
+        run: pnpm setup:min
+      - name: Build compiler
+        run: pnpm --filter @typespec/compiler build
+      - name: Format focused test source
+        run: pnpm exec prettier packages/compiler/test/testing/expect.test.ts --write
+      - name: Focused diagnostic matcher tests
+        run: pnpm --filter @typespec/compiler test test/testing/expect.test.ts
+      - name: Full compiler tests
+        run: pnpm --filter @typespec/compiler test
+      - name: Compiler lint
+        run: pnpm --filter @typespec/compiler lint
+      - name: Collect test source and formatting diff
+        if: always()
+        run: |
+          git diff --check
+          git diff -- packages/compiler/test/testing/expect.test.ts > unordered-11710-format.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unordered-11710-validation
+          path: |
+            packages/compiler/test/testing/expect.test.ts
+            unordered-11710-format.patch
+          retention-days: 7
