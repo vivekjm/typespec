@@ -1,0 +1,125 @@
+name: Audit public PR maintenance
+
+on:
+  push:
+    branches:
+      - maintenance/public-pr-audit-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-pr-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Read public pull requests, reviews, and head checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import datetime
+          import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          headers = {
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+          }
+          def get(path):
+              assert path.startswith(('search/issues?', 'repos/'))
+              request = urllib.request.Request('https://api.github.com/' + path, headers=headers)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          def pages(path, key=None):
+              result = []
+              for page in range(1, 11):
+                  separator = '&' if '?' in path else '?'
+                  response = get(path + separator + 'per_page=100&page=' + str(page))
+                  batch = response[key] if key else response
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+              raise RuntimeError('Pagination limit reached: ' + path)
+
+          query = urllib.parse.quote('is:pr is:open author:vivekjm is:public')
+          search = get('search/issues?q=' + query + '&per_page=100&sort=updated')
+          assert not search.get('incomplete_results')
+          items = search['items']
+          assert len(items) == search['total_count'], 'Public inventory needs another search page'
+
+          def compact_comment(item):
+              return {key: item.get(key) for key in ('id', 'html_url', 'body', 'created_at', 'updated_at', 'state', 'commit_id', 'path', 'line', 'in_reply_to_id')} | {'author': item.get('user', {}).get('login'), 'author_type': item.get('user', {}).get('type')}
+
+          def inspect(item):
+              repo = item['repository_url'].split('/repos/', 1)[1]
+              number = item['number']
+              prefix = 'repos/' + repo
+              pull = get(prefix + '/pulls/' + str(number))
+              assert pull['user']['login'] == 'vivekjm' and not pull['base']['repo']['private']
+              for _ in range(3):
+                  if pull.get('mergeable') is not None:
+                      break
+                  time.sleep(1)
+                  pull = get(prefix + '/pulls/' + str(number))
+              sha = pull['head']['sha']
+              record = {
+                  'repo': repo, 'number': number, 'url': pull['html_url'],
+                  'title': pull['title'], 'state': pull['state'], 'draft': pull['draft'],
+                  'head_sha': sha, 'head_branch': pull['head']['ref'],
+                  'head_repo': (pull['head'].get('repo') or {}).get('full_name'),
+                  'base_sha': pull['base']['sha'], 'mergeable': pull.get('mergeable'),
+                  'mergeable_state': pull.get('mergeable_state'), 'updated_at': pull['updated_at'],
+                  'labels': [label['name'] for label in pull['labels']],
+                  'changed_files': pull['changed_files'],
+                  'body': pull['body'],
+              }
+              endpoints = {
+                  'conversation': (prefix + '/issues/' + str(number) + '/comments', None),
+                  'review_comments': (prefix + '/pulls/' + str(number) + '/comments', None),
+                  'reviews': (prefix + '/pulls/' + str(number) + '/reviews', None),
+              }
+              for name, (path, key) in endpoints.items():
+                  record[name] = [compact_comment(comment) for comment in pages(path, key)]
+              status = get(prefix + '/commits/' + sha + '/status')
+              record['combined_status'] = status['state']
+              record['statuses'] = [{k: value.get(k) for k in ('context', 'state', 'description', 'target_url', 'updated_at')} for value in status['statuses']]
+              record['checks'] = [{k: value.get(k) for k in ('name', 'status', 'conclusion', 'html_url', 'details_url', 'started_at', 'completed_at')} for value in pages(prefix + '/commits/' + sha + '/check-runs', 'check_runs')]
+              return record
+
+          records, errors = [], []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+              futures = {executor.submit(inspect, item): item['html_url'] for item in items}
+              for future in concurrent.futures.as_completed(futures):
+                  try:
+                      records.append(future.result())
+                  except Exception as error:
+                      errors.append({'url': futures[future], 'error': str(error)})
+          records.sort(key=lambda item: (item['repo'], item['number']))
+          report = {'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'search_count': search['total_count'], 'inspected_count': len(records), 'errors': errors, 'pull_requests': records}
+          Path('public-pr-audit.json').write_text(json.dumps(report, indent=2) + '\n')
+          summary = [f"Inspected {len(records)} of {search['total_count']} public pull requests; errors: {len(errors)}"]
+          for record in records:
+              failures = [check['name'] for check in record['checks'] if check['conclusion'] in ('failure', 'timed_out', 'cancelled')]
+              print(f"{record['repo']}#{record['number']}: mergeable={record['mergeable']} state={record['mergeable_state']} draft={record['draft']} failing_checks={failures}")
+              summary.append(f"{record['repo']}#{record['number']}: mergeable={record['mergeable']}; state={record['mergeable_state']}; draft={record['draft']}; failing_checks={failures}")
+          Path('public-pr-audit-summary.txt').write_text('\n'.join(summary) + '\n')
+          assert not errors, 'Read errors are recorded in the artifact'
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-pr-audit-20260906
+          path: |
+            public-pr-audit.json
+            public-pr-audit-summary.txt
+          retention-days: 7
