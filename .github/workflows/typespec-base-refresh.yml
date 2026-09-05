@@ -1,0 +1,151 @@
+name: Validate TypeSpec base refresh
+
+on:
+  push:
+    branches:
+      - maintenance/typespec-base-refresh-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 11695
+            head: d6c52da04a2599d5ef3dd317b468b511e5712571
+            package: http
+            change: merge-patch-null-record-values-2026-08-16.md
+          - pr: 11710
+            head: 362ec4e946132f9851ee0d9cbf78b051a0f308c0
+            package: compiler
+            change: unordered-diagnostic-expectations-2026-08-18.md
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 17011f12469dc6e0f9205753548a362dd553d57e
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Merge the existing PR into the pinned upstream base locally
+        env:
+          PR_HEAD: ${{ matrix.head }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/vivekjm/typespec.git "$PR_HEAD"
+          git merge --no-commit --no-ff "$PR_HEAD"
+      - name: Install repository-pinned pnpm and bootstrap
+        run: |
+          npm install --global "$(node -p 'require("./package.json").packageManager.split("+")[0]')"
+          pnpm setup:min
+      - name: Build the affected package and dependency closure
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: pnpm --filter "@typespec/${PACKAGE}..." run build
+      - name: Run the entire affected package suite
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -o pipefail
+          pnpm --filter "@typespec/${PACKAGE}" test 2>&1 | tee package-tests.log
+      - name: Lint the affected package
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: pnpm --filter "@typespec/${PACKAGE}" lint
+      - name: Check formatting and collect the exact candidate
+        env:
+          PR_NUMBER: ${{ matrix.pr }}
+          PR_HEAD: ${{ matrix.head }}
+          PACKAGE: ${{ matrix.package }}
+          CHANGE: ${{ matrix.change }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, shutil, subprocess
+          from pathlib import Path
+          pr = int(os.environ['PR_NUMBER'])
+          if pr == 11695:
+              paths = ['packages/http/src/merge-patch.ts', 'packages/http/test/merge-patch.test.ts']
+          elif pr == 11710:
+              paths = ['packages/compiler/src/testing/expect.ts', 'packages/compiler/test/testing/expect.test.ts']
+          else:
+              raise AssertionError(pr)
+          paths.append('.chronus/changes/' + os.environ['CHANGE'])
+          base = '17011f12469dc6e0f9205753548a362dd553d57e'
+          actual = subprocess.check_output(['git', 'diff', base, '--name-only'], text=True).splitlines()
+          assert set(actual) == set(paths), actual
+          subprocess.run(['pnpm', 'exec', 'prettier', '--check', *paths], check=True)
+          subprocess.run(['git', 'diff', base, '--check'], check=True)
+          manifest = {'pr': pr, 'old_head': os.environ['PR_HEAD'], 'upstream': base, 'files': {}}
+          for path in paths:
+              data = Path(path).read_bytes()
+              manifest['files'][path] = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              dest = Path('candidate') / path
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, dest)
+          Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2))
+          Path('candidate/pr.patch').write_bytes(subprocess.check_output(['git', 'diff', base, '--', *paths]))
+          shutil.copyfile('package-tests.log', 'candidate/package-tests.log')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: typespec-base-refresh-${{ matrix.pr }}
+          path: candidate
+          include-hidden-files: true
+          retention-days: 7
+  stage:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        pr: [11695, 11710]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: typespec-base-refresh-${{ matrix.pr }}
+          path: candidate
+      - name: Publish a verified candidate branch only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ matrix.pr }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          pr = int(os.environ['PR_NUMBER'])
+          expected_heads = {11695: 'd6c52da04a2599d5ef3dd317b468b511e5712571', 11710: '362ec4e946132f9851ee0d9cbf78b051a0f308c0'}
+          manifest = json.loads(Path('candidate/manifest.json').read_text())
+          assert manifest['pr'] == pr
+          assert manifest['old_head'] == expected_heads[pr]
+          assert manifest['upstream'] == '17011f12469dc6e0f9205753548a362dd553d57e'
+          root = 'https://api.github.com/repos/vivekjm/typespec/'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}
+          def post(path, data):
+              with urlopen(Request(root + path, data=json.dumps(data).encode(), headers=headers, method='POST'), timeout=30) as response:
+                  return json.load(response)
+          entries = []
+          assert len(manifest['files']) == 3
+          for path, expected in manifest['files'].items():
+              assert path.startswith(('packages/http/', 'packages/compiler/', '.chronus/changes/')) and '..' not in Path(path).parts
+              data = (Path('candidate') / path).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected
+              blob = post('git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert blob['sha'] == expected
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': expected})
+          tree = post('git/trees', {'base_tree': '6c941bb04445694e0dd6f4a563c66e50156739bc', 'tree': entries})
+          commit = post('git/commits', {'message': 'Merge current main into PR #' + str(pr) + ' after package validation', 'tree': tree['sha'], 'parents': [manifest['old_head'], manifest['upstream']]})
+          branch = 'maintenance/typespec-' + str(pr) + '-validated-20260906'
+          post('git/refs', {'ref': 'refs/heads/' + branch, 'sha': commit['sha']})
+          print(json.dumps({'candidate_sha': commit['sha'], 'branch': branch, 'tree_sha': tree['sha'], 'manifest': manifest}, indent=2))
+          PY
